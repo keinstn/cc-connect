@@ -39,6 +39,13 @@ import (
 // chatBotScope authorizes posting messages as the Chat app (app auth).
 const chatBotScope = "https://www.googleapis.com/auth/chat.bot"
 
+// sessionKeyPrefix and threadSep are used by both buildSessionKey and
+// ReconstructReplyCtx so the encode/decode pair stays in sync.
+const (
+	sessionKeyPrefix = "googlechat:"
+	threadSep        = ":t:"
+)
+
 // chatAPIBase is the Chat REST API base; a var so tests can build URLs against it.
 var chatAPIBase = "https://chat.googleapis.com/v1/"
 
@@ -61,7 +68,6 @@ type Platform struct {
 	projectID       string // parsed from subscription, for the Pub/Sub client
 	credentialsFile string // service-account key, used for both receive and send
 	allowFrom       string
-	trigger         string
 	sessionScope    string // "space" (default) | "thread" | "user"
 
 	botClient *http.Client // service-account authed client for sending
@@ -99,7 +105,6 @@ func New(opts map[string]any) (core.Platform, error) {
 	botClient := conf.Client(context.Background())
 
 	allowFrom, _ := opts["allow_from"].(string)
-	trigger, _ := opts["trigger"].(string)
 
 	core.CheckAllowFrom("googlechat", allowFrom)
 
@@ -108,7 +113,6 @@ func New(opts map[string]any) (core.Platform, error) {
 		projectID:       projectID,
 		credentialsFile: credentialsFile,
 		allowFrom:       allowFrom,
-		trigger:         trigger,
 		sessionScope:    normalizeSessionScope(opts["session_scope"]),
 		botClient:       botClient,
 	}, nil
@@ -136,6 +140,7 @@ func normalizeSessionScope(raw any) string {
 	case "space", "":
 		return "space"
 	default:
+		slog.Warn("googlechat: unknown session_scope, using \"space\"", "value", s)
 		return "space"
 	}
 }
@@ -249,7 +254,7 @@ func (p *Platform) parseEvent(data []byte) (*core.Message, bool) {
 		return nil, false
 	}
 
-	content, ok := p.extractContent(m)
+	content, ok := extractContent(m)
 	if !ok {
 		return nil, false
 	}
@@ -268,19 +273,9 @@ func (p *Platform) parseEvent(data []byte) (*core.Message, bool) {
 	}, true
 }
 
-// extractContent returns the prompt text for a message. With a trigger word
-// configured, only messages starting with it are handled and the prefix is
-// stripped. Otherwise argumentText is used, which Google already strips of the
-// @mention markup, falling back to text.
-func (p *Platform) extractContent(m chatAppMessage) (string, bool) {
-	if t := strings.TrimSpace(p.trigger); t != "" {
-		text := strings.TrimSpace(m.Text)
-		if !strings.HasPrefix(text, t) {
-			return "", false
-		}
-		content := strings.TrimSpace(strings.TrimPrefix(text, t))
-		return content, content != ""
-	}
+// extractContent returns the prompt text for a message. argumentText is used
+// (Google strips the @mention markup from it), falling back to text.
+func extractContent(m chatAppMessage) (string, bool) {
 	content := strings.TrimSpace(m.ArgumentText)
 	if content == "" {
 		content = strings.TrimSpace(m.Text)
@@ -298,13 +293,13 @@ func (p *Platform) buildSessionKey(space, user, thread string) string {
 	switch p.sessionScope {
 	case "thread":
 		if thread != "" {
-			return fmt.Sprintf("googlechat:%s:t:%s", space, thread)
+			return sessionKeyPrefix + space + threadSep + thread
 		}
-		return "googlechat:" + space
+		return sessionKeyPrefix + space
 	case "user":
-		return fmt.Sprintf("googlechat:%s:%s", space, user)
+		return sessionKeyPrefix + space + ":" + user
 	default:
-		return "googlechat:" + space
+		return sessionKeyPrefix + space
 	}
 }
 
@@ -313,12 +308,12 @@ func (p *Platform) buildSessionKey(space, user, thread string) string {
 // thread. Implements core.ReplyContextReconstructor.
 func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
 	// googlechat:<space>  |  googlechat:<space>:t:<thread>  |  googlechat:<space>:<user>
-	rest, ok := strings.CutPrefix(sessionKey, "googlechat:")
+	rest, ok := strings.CutPrefix(sessionKey, sessionKeyPrefix)
 	if !ok {
 		return nil, fmt.Errorf("googlechat: invalid session key %q", sessionKey)
 	}
-	if idx := strings.Index(rest, ":t:"); idx != -1 {
-		return replyContext{space: rest[:idx], thread: rest[idx+3:]}, nil
+	if idx := strings.Index(rest, threadSep); idx != -1 {
+		return replyContext{space: rest[:idx], thread: rest[idx+len(threadSep):]}, nil
 	}
 	// User-scoped keys append ":<user>" where user is "users/<id>"; strip a
 	// trailing "users/..." segment to recover the bare space.
@@ -345,6 +340,23 @@ func buildSendRequest(rc replyContext, content string) (string, []byte, error) {
 	return url, b, nil
 }
 
+// doRequest executes req using botClient and returns the response on success.
+// On non-2xx it reads the error body, closes it, and returns an error.
+// The caller is responsible for draining and closing resp.Body on success.
+func (p *Platform) doRequest(req *http.Request) (*http.Response, error) {
+	resp, err := p.botClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		resp.Body.Close()
+		return nil, fmt.Errorf("googlechat: %s %s: status %d: %s",
+			req.Method, req.URL.Path, resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	return resp, nil
+}
+
 func (p *Platform) post(ctx context.Context, rctx any, content string) error {
 	rc, ok := rctx.(replyContext)
 	if !ok {
@@ -362,15 +374,12 @@ func (p *Platform) post(ctx context.Context, rctx any, content string) error {
 		return fmt.Errorf("googlechat: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := p.botClient.Do(req)
+	resp, err := p.doRequest(req)
 	if err != nil {
-		return fmt.Errorf("googlechat: send: %w", err)
+		return err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return fmt.Errorf("googlechat: send: status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
-	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
 	return nil
 }
 
@@ -533,3 +542,22 @@ func (p *Platform) Stop() error {
 	}
 	return nil
 }
+
+// FormattingInstructions returns Google Chat text-formatting guidance for the agent.
+func (p *Platform) FormattingInstructions() string {
+	return `You are responding in Google Chat. Use Google Chat's text formatting, NOT standard Markdown:
+- Bold: *bold* (single asterisks)
+- Italic: _italic_
+- Strikethrough: ~text~
+- Inline code: ` + "`text`" + `
+- Code block: ` + "```text```" + `
+- Block quote: >text
+- Lists: use - or * prefix normally
+- Do NOT use ## headings — Google Chat does not render them. Use *bold* on its own line instead.
+- Do NOT use [text](url) Markdown links.
+  - To auto-link a URL: paste the raw URL directly — Google Chat will linkify it.
+  - To link with display text: <https://example.com|display text>`
+}
+
+// compile-time assertion that *Platform implements core.FormattingInstructionProvider.
+var _ core.FormattingInstructionProvider = (*Platform)(nil)
