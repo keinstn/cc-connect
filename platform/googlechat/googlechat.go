@@ -323,21 +323,50 @@ func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
 	return replyContext{space: rest}, nil
 }
 
+// httpErrorBody reads up to 2048 bytes from resp.Body, closes it, and returns
+// an error combining prefix, status code, and the response snippet.
+func httpErrorBody(resp *http.Response, prefix string) error {
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+	resp.Body.Close()
+	return fmt.Errorf("%s: status %d: %s", prefix, resp.StatusCode, strings.TrimSpace(string(b)))
+}
+
+// coalesce returns s if non-empty, otherwise def.
+func coalesce(s, def string) string {
+	if s != "" {
+		return s
+	}
+	return def
+}
+
+// messageURL returns the Chat messages endpoint for rc's space, appending the
+// messageReplyOption query when a thread is known.
+func messageURL(rc replyContext) string {
+	u := chatAPIBase + rc.space + "/messages"
+	if rc.thread != "" {
+		u += "?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
+	}
+	return u
+}
+
+// applyThread adds the thread field to body when rc has a thread.
+func applyThread(body map[string]any, rc replyContext) {
+	if rc.thread != "" {
+		body["thread"] = map[string]any{"name": rc.thread}
+	}
+}
+
 // buildSendRequest builds the Chat REST API URL and JSON body to post content
 // into rc's space. When a thread is known the reply is threaded (falling back
 // to a new thread if that thread no longer accepts replies).
 func buildSendRequest(rc replyContext, content string) (string, []byte, error) {
 	body := map[string]any{"text": content}
-	url := chatAPIBase + rc.space + "/messages"
-	if rc.thread != "" {
-		body["thread"] = map[string]any{"name": rc.thread}
-		url += "?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
-	}
+	applyThread(body, rc)
 	b, err := json.Marshal(body)
 	if err != nil {
 		return "", nil, fmt.Errorf("googlechat: marshal body: %w", err)
 	}
-	return url, b, nil
+	return messageURL(rc), b, nil
 }
 
 // doRequest executes req using botClient and returns the response on success.
@@ -349,10 +378,7 @@ func (p *Platform) doRequest(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		resp.Body.Close()
-		return nil, fmt.Errorf("googlechat: %s %s: status %d: %s",
-			req.Method, req.URL.Path, resp.StatusCode, strings.TrimSpace(string(b)))
+		return nil, httpErrorBody(resp, fmt.Sprintf("googlechat: %s %s", req.Method, req.URL.Path))
 	}
 	return resp, nil
 }
@@ -394,8 +420,8 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 // uploadAttachment uploads raw bytes to the Chat media endpoint using a
 // multipart/related request and returns the attachmentDataRef resource name.
 func (p *Platform) uploadAttachment(ctx context.Context, space, filename, mimeType string, data []byte) (string, error) {
-	var buf bytes.Buffer
-	mw := multipart.NewWriter(&buf)
+	buf := bytes.NewBuffer(make([]byte, 0, 256+len(data)))
+	mw := multipart.NewWriter(buf)
 
 	metaPart, err := mw.CreatePart(textproto.MIMEHeader{"Content-Type": {"application/json; charset=UTF-8"}})
 	if err != nil {
@@ -415,7 +441,7 @@ func (p *Platform) uploadAttachment(ctx context.Context, space, filename, mimeTy
 	mw.Close()
 
 	uploadURL := chatUploadBase + space + "/attachments:upload?uploadType=multipart"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uploadURL, &buf)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uploadURL, buf)
 	if err != nil {
 		return "", fmt.Errorf("googlechat: upload: build request: %w", err)
 	}
@@ -425,11 +451,10 @@ func (p *Platform) uploadAttachment(ctx context.Context, space, filename, mimeTy
 	if err != nil {
 		return "", fmt.Errorf("googlechat: upload: %w", err)
 	}
-	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return "", fmt.Errorf("googlechat: upload: status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		return "", httpErrorBody(resp, "googlechat: upload")
 	}
+	defer resp.Body.Close()
 
 	var result struct {
 		AttachmentDataRef struct {
@@ -454,21 +479,20 @@ func buildAttachmentRequest(rc replyContext, resourceName string) (string, []byt
 			{"attachmentDataRef": map[string]any{"resourceName": resourceName}},
 		},
 	}
-	url := chatAPIBase + rc.space + "/messages"
-	if rc.thread != "" {
-		body["thread"] = map[string]any{"name": rc.thread}
-		url += "?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
-	}
+	applyThread(body, rc)
 	b, err := json.Marshal(body)
 	if err != nil {
 		return "", nil, fmt.Errorf("googlechat: marshal attachment body: %w", err)
 	}
-	return url, b, nil
+	return messageURL(rc), b, nil
 }
 
 // postAttachment uploads data then creates a Chat message carrying the
 // attachmentDataRef. Shared by SendImage and SendFile.
 func (p *Platform) postAttachment(ctx context.Context, rc replyContext, filename, mimeType string, data []byte) error {
+	if rc.space == "" {
+		return fmt.Errorf("googlechat: missing space in reply context")
+	}
 	resourceName, err := p.uploadAttachment(ctx, rc.space, filename, mimeType, data)
 	if err != nil {
 		return err
@@ -482,15 +506,12 @@ func (p *Platform) postAttachment(ctx context.Context, rc replyContext, filename
 		return fmt.Errorf("googlechat: attachment message: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := p.botClient.Do(req)
+	resp, err := p.doRequest(req)
 	if err != nil {
-		return fmt.Errorf("googlechat: attachment message: send: %w", err)
+		return err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return fmt.Errorf("googlechat: attachment message: status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
-	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
 	return nil
 }
 
@@ -501,15 +522,10 @@ func (p *Platform) SendImage(ctx context.Context, rctx any, img core.ImageAttach
 	if !ok {
 		return fmt.Errorf("googlechat: SendImage: invalid reply context type %T", rctx)
 	}
-	name := img.FileName
-	if name == "" {
-		name = "image.png"
-	}
-	mimeType := img.MimeType
-	if mimeType == "" {
-		mimeType = "image/png"
-	}
-	return p.postAttachment(ctx, rc, name, mimeType, img.Data)
+	return p.postAttachment(ctx, rc,
+		coalesce(img.FileName, "image.png"),
+		coalesce(img.MimeType, "image/png"),
+		img.Data)
 }
 
 // SendFile uploads a file and posts it as a Chat message attachment.
@@ -519,15 +535,10 @@ func (p *Platform) SendFile(ctx context.Context, rctx any, file core.FileAttachm
 	if !ok {
 		return fmt.Errorf("googlechat: SendFile: invalid reply context type %T", rctx)
 	}
-	name := file.FileName
-	if name == "" {
-		name = "attachment"
-	}
-	mimeType := file.MimeType
-	if mimeType == "" {
-		mimeType = "application/octet-stream"
-	}
-	return p.postAttachment(ctx, rc, name, mimeType, file.Data)
+	return p.postAttachment(ctx, rc,
+		coalesce(file.FileName, "attachment"),
+		coalesce(file.MimeType, "application/octet-stream"),
+		file.Data)
 }
 
 var _ core.ImageSender = (*Platform)(nil)
