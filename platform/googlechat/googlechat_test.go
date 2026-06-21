@@ -121,6 +121,86 @@ func TestParseEvent_DropsOldMessage(t *testing.T) {
 	}
 }
 
+// fakeAckMsg is a test double for *pubsub.Message that records Ack/Nack calls
+// and supports optional callbacks so tests can track call ordering.
+type fakeAckMsg struct {
+	acked  bool
+	nacked bool
+	ackFn  func()
+	nackFn func()
+}
+
+func (f *fakeAckMsg) Ack() {
+	f.acked = true
+	if f.ackFn != nil {
+		f.ackFn()
+	}
+}
+
+func (f *fakeAckMsg) Nack() {
+	f.nacked = true
+	if f.nackFn != nil {
+		f.nackFn()
+	}
+}
+
+func TestDispatchMessage_AcksAfterHandler(t *testing.T) {
+	p := newTestPlatform("*", "space")
+	data := messageEvent(t, humanMessage("hello", "hello"))
+
+	var events []string
+	m := &fakeAckMsg{ackFn: func() { events = append(events, "ack") }}
+	p.handler = func(_ core.Platform, _ *core.Message) {
+		events = append(events, "handler")
+	}
+	p.dispatchMessage(m, data)
+
+	want := []string{"handler", "ack"}
+	if len(events) != len(want) || events[0] != want[0] || events[1] != want[1] {
+		t.Errorf("event order: got %v, want %v", events, want)
+	}
+	if m.nacked {
+		t.Error("Nack should not be called on success")
+	}
+}
+
+func TestDispatchMessage_NacksOnPanic(t *testing.T) {
+	p := newTestPlatform("*", "space")
+	data := messageEvent(t, humanMessage("hello", "hello"))
+
+	m := &fakeAckMsg{}
+	p.handler = func(_ core.Platform, _ *core.Message) {
+		panic("simulated handler panic")
+	}
+	p.dispatchMessage(m, data)
+
+	if m.acked {
+		t.Error("Ack should not be called when handler panics")
+	}
+	if !m.nacked {
+		t.Error("Nack should be called when handler panics")
+	}
+}
+
+func TestDispatchMessage_AcksOnParseFailure(t *testing.T) {
+	p := newTestPlatform("*", "space")
+
+	handlerCalled := false
+	m := &fakeAckMsg{}
+	p.handler = func(_ core.Platform, _ *core.Message) { handlerCalled = true }
+	p.dispatchMessage(m, []byte("not-json"))
+
+	if !m.acked {
+		t.Error("Ack should be called for unparseable messages")
+	}
+	if m.nacked {
+		t.Error("Nack should not be called for unparseable messages")
+	}
+	if handlerCalled {
+		t.Error("handler should not be called for unparseable messages")
+	}
+}
+
 func TestBuildSessionKey(t *testing.T) {
 	cases := []struct {
 		scope, space, user, thread, want string

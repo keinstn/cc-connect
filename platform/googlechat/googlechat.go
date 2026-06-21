@@ -192,15 +192,36 @@ func (p *Platform) receiveLoop(ctx context.Context) {
 	}
 }
 
-// handleMessage acks the Pub/Sub message and dispatches it to the handler when
-// it is a usable Chat message. The message is acked regardless so non-message
-// events (e.g. ADDED_TO_SPACE) are not redelivered.
+// ackable is the subset of *pubsub.Message used by dispatchMessage, allowing
+// the dispatch logic to be tested without a real Pub/Sub client.
+type ackable interface {
+	Ack()
+	Nack()
+}
+
+// handleMessage is the Pub/Sub receive callback; it delegates to dispatchMessage.
 func (p *Platform) handleMessage(m *pubsub.Message) {
-	msg, ok := p.parseEvent(m.Data)
-	m.Ack()
+	p.dispatchMessage(m, m.Data)
+}
+
+// dispatchMessage parses data and routes it to the handler.
+// Non-message events (e.g. ADDED_TO_SPACE) are acked immediately so they are
+// not redelivered. For valid messages, ack happens after the handler returns;
+// if the handler panics the message is nacked so Pub/Sub can redeliver it.
+func (p *Platform) dispatchMessage(m ackable, data []byte) {
+	msg, ok := p.parseEvent(data)
 	if !ok {
+		m.Ack()
 		return
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("googlechat: handler panic", "recover", r)
+			m.Nack()
+			return
+		}
+		m.Ack()
+	}()
 	p.handler(p, msg)
 }
 
