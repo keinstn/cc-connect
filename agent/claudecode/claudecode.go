@@ -129,6 +129,9 @@ func New(opts map[string]any) (core.Agent, error) {
 	if workDir == "" {
 		workDir = "."
 	}
+	if _, err := os.Stat(workDir); os.IsNotExist(err) {
+		return nil, fmt.Errorf("claudecode: work_dir %q does not exist", workDir)
+	}
 	cliBin := "claude"
 	var cliExtraArgs []string
 	if cliPath, _ := opts["cli_path"].(string); cliPath != "" {
