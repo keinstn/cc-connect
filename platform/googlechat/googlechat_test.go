@@ -178,7 +178,7 @@ func TestFormattingInstructions(t *testing.T) {
 	if s == "" {
 		t.Fatal("FormattingInstructions() returned empty string")
 	}
-	for _, want := range []string{"*bold*", "_italic_", "##", "[text](url)"} {
+	for _, want := range []string{"*bold*", "_italic_", "##", "[text](url)", ">text", "|display text"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("FormattingInstructions() missing expected substring %q", want)
 		}

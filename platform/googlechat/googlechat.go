@@ -395,9 +395,12 @@ func (p *Platform) FormattingInstructions() string {
 - Strikethrough: ~text~
 - Inline code: ` + "`text`" + `
 - Code block: ` + "```text```" + `
+- Block quote: >text
 - Lists: use - or * prefix normally
 - Do NOT use ## headings — Google Chat does not render them. Use *bold* on its own line instead.
-- Do NOT use [text](url) Markdown links — paste raw URLs; Google Chat auto-links them.`
+- Do NOT use [text](url) Markdown links.
+  - To auto-link a URL: paste the raw URL directly — Google Chat will linkify it.
+  - To link with display text: <https://example.com|display text>`
 }
 
 // compile-time assertion that *Platform implements core.FormattingInstructionProvider.
