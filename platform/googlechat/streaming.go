@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 
 	"github.com/chenhg5/cc-connect/core"
 )
@@ -39,21 +38,19 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 		return nil, fmt.Errorf("googlechat: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := p.botClient.Do(req)
+	resp, err := p.doRequest(req)
 	if err != nil {
 		return nil, fmt.Errorf("googlechat: send preview: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return nil, fmt.Errorf("googlechat: send preview: status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
-	}
 	var msg struct {
 		Name string `json:"name"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&msg); err != nil {
 		return nil, fmt.Errorf("googlechat: parse create response: %w", err)
 	}
+	// drain any bytes json.Decoder left unread so the connection is reusable
+	_, _ = io.Copy(io.Discard, resp.Body)
 	if msg.Name == "" {
 		return nil, fmt.Errorf("googlechat: create response missing message name")
 	}
@@ -87,15 +84,12 @@ func (p *Platform) UpdateMessage(ctx context.Context, handle any, content string
 		return fmt.Errorf("googlechat: build update request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := p.botClient.Do(req)
+	resp, err := p.doRequest(req)
 	if err != nil {
-		return fmt.Errorf("googlechat: update message: %w", err)
+		return err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return fmt.Errorf("googlechat: update message: status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
-	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
 	return nil
 }
 
