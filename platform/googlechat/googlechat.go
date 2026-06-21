@@ -32,6 +32,7 @@ import (
 	"github.com/chenhg5/cc-connect/core"
 
 	"cloud.google.com/go/pubsub/v2"
+	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/option"
 )
@@ -67,6 +68,7 @@ type Platform struct {
 	subscription    string // full resource name: projects/<p>/subscriptions/<s>
 	projectID       string // parsed from subscription, for the Pub/Sub client
 	credentialsFile string // service-account key, used for both receive and send
+	tokenSource     oauth2.TokenSource
 	allowFrom       string
 	sessionScope    string // "space" (default) | "thread" | "user"
 
@@ -98,7 +100,8 @@ func New(opts map[string]any) (core.Platform, error) {
 	if err != nil {
 		return nil, fmt.Errorf("googlechat: read credentials_file: %w", err)
 	}
-	conf, err := google.JWTConfigFromJSON(keyBytes, chatBotScope)
+	conf, err := google.JWTConfigFromJSON(keyBytes,
+		chatBotScope, "https://www.googleapis.com/auth/pubsub")
 	if err != nil {
 		return nil, fmt.Errorf("googlechat: parse service account credentials: %w", err)
 	}
@@ -112,6 +115,7 @@ func New(opts map[string]any) (core.Platform, error) {
 		subscription:    subscription,
 		projectID:       projectID,
 		credentialsFile: credentialsFile,
+		tokenSource:     conf.TokenSource(context.Background()),
 		allowFrom:       allowFrom,
 		sessionScope:    normalizeSessionScope(opts["session_scope"]),
 		botClient:       botClient,
@@ -153,7 +157,7 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
 
-	client, err := pubsub.NewClient(ctx, p.projectID, option.WithCredentialsFile(p.credentialsFile))
+	client, err := pubsub.NewClient(ctx, p.projectID, option.WithTokenSource(p.tokenSource))
 	if err != nil {
 		cancel()
 		return fmt.Errorf("googlechat: create pubsub client: %w", err)
@@ -327,7 +331,9 @@ func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
 // an error combining prefix, status code, and the response snippet.
 func httpErrorBody(resp *http.Response, prefix string) error {
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-	resp.Body.Close()
+	if err := resp.Body.Close(); err != nil {
+		return fmt.Errorf("%s: status %d: %s (close body: %v)", prefix, resp.StatusCode, strings.TrimSpace(string(b)), err)
+	}
 	return fmt.Errorf("%s: status %d: %s", prefix, resp.StatusCode, strings.TrimSpace(string(b)))
 }
 
@@ -404,8 +410,13 @@ func (p *Platform) post(ctx context.Context, rctx any, content string) error {
 	if err != nil {
 		return err
 	}
-	_, _ = io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		_ = resp.Body.Close()
+		return fmt.Errorf("googlechat: drain response body: %w", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		return fmt.Errorf("googlechat: close response body: %w", err)
+	}
 	return nil
 }
 
@@ -438,7 +449,9 @@ func (p *Platform) uploadAttachment(ctx context.Context, space, filename, mimeTy
 	if _, err := mediaPart.Write(data); err != nil {
 		return "", fmt.Errorf("googlechat: upload: write media: %w", err)
 	}
-	mw.Close()
+	if err := mw.Close(); err != nil {
+		return "", fmt.Errorf("googlechat: upload: finalize multipart body: %w", err)
+	}
 
 	uploadURL := chatUploadBase + space + "/attachments:upload?uploadType=multipart"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uploadURL, buf)
@@ -451,7 +464,11 @@ func (p *Platform) uploadAttachment(ctx context.Context, space, filename, mimeTy
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			slog.Warn("googlechat: close upload response body", "error", err)
+		}
+	}()
 
 	var result struct {
 		AttachmentDataRef struct {
@@ -508,8 +525,13 @@ func (p *Platform) postAttachment(ctx context.Context, rc replyContext, filename
 	if err != nil {
 		return err
 	}
-	_, _ = io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		_ = resp.Body.Close()
+		return fmt.Errorf("googlechat: drain attachment create response body: %w", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		return fmt.Errorf("googlechat: close attachment create response body: %w", err)
+	}
 	return nil
 }
 

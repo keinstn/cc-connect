@@ -316,12 +316,16 @@ func testAttachmentServer(t *testing.T, uploadFn, msgFn http.HandlerFunc) (p *Pl
 	if uploadFn == nil {
 		uploadFn = func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintln(w, `{"attachmentDataRef":{"resourceName":"ref/default"}}`)
+			if _, err := fmt.Fprintln(w, `{"attachmentDataRef":{"resourceName":"ref/default"}}`); err != nil {
+				t.Fatalf("write default upload response: %v", err)
+			}
 		}
 	}
 	if msgFn == nil {
 		msgFn = func(w http.ResponseWriter, r *http.Request) {
-			fmt.Fprintln(w, "{}")
+			if _, err := fmt.Fprintln(w, "{}"); err != nil {
+				t.Fatalf("write default message response: %v", err)
+			}
 		}
 	}
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -355,7 +359,9 @@ func TestUploadAttachment_Success(t *testing.T) {
 func TestUploadAttachment_HTTPError(t *testing.T) {
 	p, restore := testAttachmentServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
-		fmt.Fprintln(w, "access denied")
+		if _, err := fmt.Fprintln(w, "access denied"); err != nil {
+			t.Fatalf("write forbidden response: %v", err)
+		}
 	}, nil)
 	defer restore()
 	_, err := p.uploadAttachment(context.Background(), "spaces/X", "f.txt", "text/plain", []byte("x"))
@@ -367,7 +373,9 @@ func TestUploadAttachment_HTTPError(t *testing.T) {
 func TestUploadAttachment_EmptyResourceName(t *testing.T) {
 	p, restore := testAttachmentServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintln(w, `{"attachmentDataRef":{"resourceName":""}}`)
+		if _, err := fmt.Fprintln(w, `{"attachmentDataRef":{"resourceName":""}}`); err != nil {
+			t.Fatalf("write empty resourceName response: %v", err)
+		}
 	}, nil)
 	defer restore()
 	_, err := p.uploadAttachment(context.Background(), "spaces/X", "f.txt", "text/plain", []byte("x"))
@@ -389,11 +397,15 @@ func TestPostAttachment_TwoStep(t *testing.T) {
 	p, restore := testAttachmentServer(t,
 		func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintln(w, `{"attachmentDataRef":{"resourceName":"ref/xyz"}}`)
+			if _, err := fmt.Fprintln(w, `{"attachmentDataRef":{"resourceName":"ref/xyz"}}`); err != nil {
+				t.Fatalf("write upload response: %v", err)
+			}
 		},
 		func(w http.ResponseWriter, r *http.Request) {
 			gotCreateBody, _ = io.ReadAll(r.Body)
-			fmt.Fprintln(w, "{}")
+			if _, err := fmt.Fprintln(w, "{}"); err != nil {
+				t.Fatalf("write create response: %v", err)
+			}
 		},
 	)
 	defer restore()
@@ -455,7 +467,9 @@ func TestSendImage_Defaults(t *testing.T) {
 		func(w http.ResponseWriter, r *http.Request) {
 			gotFilename, gotMIME = parseUploadParts(t, r)
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintln(w, `{"attachmentDataRef":{"resourceName":"ref/1"}}`)
+			if _, err := fmt.Fprintln(w, `{"attachmentDataRef":{"resourceName":"ref/1"}}`); err != nil {
+				t.Fatalf("write upload response: %v", err)
+			}
 		},
 		nil,
 	)
@@ -479,7 +493,9 @@ func TestSendFile_Defaults(t *testing.T) {
 		func(w http.ResponseWriter, r *http.Request) {
 			gotFilename, gotMIME = parseUploadParts(t, r)
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintln(w, `{"attachmentDataRef":{"resourceName":"ref/2"}}`)
+			if _, err := fmt.Fprintln(w, `{"attachmentDataRef":{"resourceName":"ref/2"}}`); err != nil {
+				t.Fatalf("write upload response: %v", err)
+			}
 		},
 		nil,
 	)
