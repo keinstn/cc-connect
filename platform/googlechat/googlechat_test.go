@@ -157,7 +157,7 @@ func TestReconstructReplyCtx(t *testing.T) {
 }
 
 func TestFormattingInstructions(t *testing.T) {
-	p := newTestPlatform("*", "", "space")
+	p := newTestPlatform("*", "space")
 	s := p.FormattingInstructions()
 	if s == "" {
 		t.Fatal("FormattingInstructions() returned empty string")
