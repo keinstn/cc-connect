@@ -386,3 +386,19 @@ func (p *Platform) Stop() error {
 	}
 	return nil
 }
+
+// FormattingInstructions returns Google Chat text-formatting guidance for the agent.
+func (p *Platform) FormattingInstructions() string {
+	return `You are responding in Google Chat. Use Google Chat's text formatting, NOT standard Markdown:
+- Bold: *bold* (single asterisks)
+- Italic: _italic_
+- Strikethrough: ~text~
+- Inline code: ` + "`text`" + `
+- Code block: ` + "```text```" + `
+- Lists: use - or * prefix normally
+- Do NOT use ## headings — Google Chat does not render them. Use *bold* on its own line instead.
+- Do NOT use [text](url) Markdown links — paste raw URLs; Google Chat auto-links them.`
+}
+
+// compile-time assertion that *Platform implements core.FormattingInstructionProvider.
+var _ core.FormattingInstructionProvider = (*Platform)(nil)
